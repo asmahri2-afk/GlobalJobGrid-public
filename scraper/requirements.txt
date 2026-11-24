@@ -1,1 +1,1 @@
-requests==2.32.5  # v6.35.1 — external audit: pinned (was >=2.31; identical commits could install different versions)
+requests==2.34.2  # v6.35.1 — external audit: pinned (was >=2.31; identical commits could install different versions)
