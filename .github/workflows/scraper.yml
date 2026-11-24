@@ -40,7 +40,12 @@ name: Scraper
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # :00/:30 are the two most congested cron minutes on GitHub Actions —
+    # scheduled runs get delayed or silently DROPPED there under load
+    # (evidence: 9 runs so far, all manual, zero scheduled fires across
+    # 4+ h of those slots). 13/43 = same 30-min cadence (48 runs/day),
+    # off-peak minutes. Cron is UTC; fires on the default branch only.
+    - cron: "13,43 * * * *"
   workflow_dispatch: {}
 
 concurrency:
