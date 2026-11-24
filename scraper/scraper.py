@@ -1,5 +1,5 @@
 # ©️ Asmahri Abderrahman 2026. All rights reserved.
-"""Global Job Grid — structured job feeds scraper (v6.34.0).
+"""Structured job feeds scraper (v6.35.0).
 
 Runs on GitHub Actions (public-repo unlimited minutes). CONFIG-DRIVEN
 since v6.34.0: the source list AND the AI key pool come from the site —
@@ -243,6 +243,14 @@ class ProviderPool:
         self.retired_models: set[tuple] = set()  # (pid, model) retired this run
         self.stats = {p: {"calls": 0, "ok": 0, "rate_limited": 0, "key_errors": 0,
                           "parked": False, "slots": {}} for p in PROVIDER_ORDER}
+        # v6.35.0 — audit H9: "parallel" is a pseudo-provider (the web-search
+        # discovery lane, not a chat model), so it never rode PROVIDER_ORDER —
+        # but source_parallel reaches into stats["parallel"] / _slot("parallel")
+        # on the first 429/503/401/403, a KeyError that killed the whole
+        # discovery feed for the run (429s are routine on these shared keys).
+        # Seed it here like any other provider.
+        self.stats["parallel"] = {"calls": 0, "ok": 0, "rate_limited": 0,
+                                  "key_errors": 0, "parked": False, "slots": {}}
         self.enrich = {"calls": 0, "ok": 0}
         self.polish = {"calls": 0, "ok": 0, "dead_models": []}
 
@@ -424,8 +432,11 @@ def cf_polish(job: dict) -> bool:
                 job["description"] = text
                 return True
             return False
-        except Exception as exc:  # noqa: BLE001 — polish is best-effort
-            print(f"    cf polish failed ({job['url'][:60]}): {exc}", file=sys.stderr)
+        except Exception:  # noqa: BLE001 — polish is best-effort
+            # v6.35.0 — audit M32: requests exception text embeds the full
+            # REST URL (the CF account id rides it) — never print it to
+            # the PUBLIC Actions logs; the exception class is enough.
+            print(f"    cf polish failed ({job['url'][:60]}): {type(exc).__name__}", file=sys.stderr)
             return False
     return False
 
@@ -1230,7 +1241,13 @@ def load_feeds(cfg: dict | None) -> list[dict]:
     # RANDOM scrape order (the owner's design): consecutive runs must not
     # hammer the sources in the same sequence. SCRAPER_SEED pins it for
     # reproducible test runs.
-    random.Random(int(os.environ["SCRAPER_SEED"])).shuffle(feeds) if os.environ.get("SCRAPER_SEED") else random.shuffle(feeds)
+    # v6.35.0 — a non-integer SCRAPER_SEED repo variable used to crash
+    # load_feeds with a raw traceback before any scraping; fall back to
+    # the unseeded shuffle.
+    try:
+        random.Random(int(os.environ["SCRAPER_SEED"])).shuffle(feeds)
+    except (KeyError, ValueError):
+        random.shuffle(feeds)
     return feeds
 
 
@@ -1382,27 +1399,56 @@ def main() -> int:
     for job in thin:
         try:
             ai_polish(job, pool, deadline)
-            polished += 1 if len(job["description"]) >= 120 or pool.polish["ok"] else 0
+            polished += 1 if len(job["description"]) >= 120 else 0  # v6.35.0 — count only real polish (the old `or pool.polish["ok"]` over-counted failures)
         except Exception as exc:  # noqa: BLE001 — polish is best-effort per row
             print(f"    polish failed ({job['url'][:60]}): {exc}", file=sys.stderr)
 
     print(f"\ntotal: {len(all_jobs)} unique jobs, {len(failures)} failed sources, "
           f"{enriched} AI-enriched, {pool.polish['ok']}/{len(thin)} polished")
     if not all_jobs:
+        # v6.35.0 — audit M28: post the pool report BEFORE the zero-jobs
+        # return — when every enrich row fails (all keys dead, the exact
+        # scenario the AI-status panel exists to surface) the per-slot
+        # verdicts used to never ship.
+        report = pool.report()
+        report["polish"]["dead_models"] = sorted(_dead_models)[:8]
+        post_pool_report(report)
         return 0 if not failures else 2
 
     stored = duplicates = rejected = 0
     for i in range(0, len(all_jobs), MAX_BATCH):
         batch = all_jobs[i:i + MAX_BATCH]
         resp = None
-        try:
-            resp = SESSION.post(f"{SITE_URL}/api/ingest",
-                                headers={"Authorization": f"Bearer {INGEST_SECRET}"},
-                                json={"jobs": batch}, timeout=60)
-            out = resp.json()
-        except Exception:  # noqa: BLE001
-            code = resp.status_code if resp is not None else "?"
-            print(f"batch {i // MAX_BATCH + 1}: HTTP {code} (non-JSON body)", file=sys.stderr)
+        out = {}
+        # v6.35.0 — audit M27: a 429 (the edge enforces 20/min; the old
+        # fixed sleep(2) admitted ~30/min) DROPPED the batch for the run —
+        # up to 50 jobs lost per hit. Retry with backoff instead; the lane
+        # is idempotent (url dedupe + the API-side UNIQUE contract), so a
+        # re-sent batch is always safe. Non-dict JSON bodies no longer
+        # crash the loop either.
+        for attempt in range(3):
+            try:
+                resp = SESSION.post(f"{SITE_URL}/api/ingest",
+                                    headers={"Authorization": f"Bearer {INGEST_SECRET}"},
+                                    json={"jobs": batch}, timeout=60)
+                try:
+                    body = resp.json()
+                    out = body if isinstance(body, dict) else {}
+                except Exception:  # noqa: BLE001
+                    out = {}
+                if resp.status_code == 429 and attempt < 2:
+                    wait = 3.5 * (attempt + 1)
+                    print(f"batch {i // MAX_BATCH + 1}: 429 — backing off {wait:.0f}s (attempt {attempt + 1}/3)", file=sys.stderr)
+                    time.sleep(wait)
+                    continue
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f"batch {i // MAX_BATCH + 1}: transport failure ({type(exc).__name__}) — attempt {attempt + 1}/3", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(3.5 * (attempt + 1))
+                    continue
+                return 3
+        if resp is None:
             return 3
         if resp.status_code == 200 and out.get("success"):
             n = (out.get("inserted") or 0) + (out.get("sb_inserted") or 0)
@@ -1418,7 +1464,7 @@ def main() -> int:
                 return 4  # secret mismatch — fail loud, never silently
             if resp.status_code not in (200, 409, 429):
                 return 3
-        time.sleep(2)  # gentle on the ingest rate limit (20/min)
+        time.sleep(3.2)  # v6.35.0 — ≥ the edge's 20/min ingest limiter (2s admitted 30/min and tail batches 429'd)
 
     # pool telemetry (best-effort, after the batches so a ship failure
     # still exits with its loud code first)
