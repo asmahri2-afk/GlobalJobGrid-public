@@ -1,0 +1,18 @@
+{
+  "sources": [
+    { "id": "jobicy", "url": "https://jobicy.com/api/v2/remote-jobs?count=50", "name": "Jobicy", "type": "json-api", "enabled": true },
+    { "id": "remotive", "url": "https://remotive.com/api/remote-jobs?limit=50", "name": "Remotive", "type": "remotive", "enabled": true },
+    { "id": "wwr", "url": "https://weworkremotely.com/remote-jobs.rss", "name": "We Work Remotely", "type": "rss", "enabled": true },
+    { "id": "himalayas", "url": "https://himalayas.app/jobs/rss", "name": "Himalayas", "type": "rss", "enabled": true },
+    { "id": "rwfa", "url": "https://realworkfromanywhere.com/rss.xml", "name": "Real Work From Anywhere", "type": "rss", "enabled": true },
+    { "id": "politepaul", "url": "https://politepaul.com/fd/UJWjqGTJwRhI.xml", "name": "PolitePaul · US LinkedIn jobs", "type": "rss", "enabled": false },
+    { "id": "zai-websearch", "name": "Z.AI Web Search · job discovery", "type": "websearch", "enabled": true, "queries": ["site:boards.greenhouse.io remote job opening", "site:jobs.lever.co remote job opening", "site:jobs.ashbyhq.com remote job opening"], "recency": "oneWeek" },
+    { "id": "parallel-websearch", "name": "Parallel Web Search · job discovery", "type": "parallel", "enabled": true, "queries": ["remote software engineer job posting apply now", "hiring remote developer site:jobs.ashbyhq.com"] },
+    { "id": "greenhouse-stripe", "name": "Greenhouse · Stripe", "type": "greenhouse", "board": "stripe", "enabled": true },
+    { "id": "lever-spotify", "name": "Lever · Spotify", "type": "lever", "company": "spotify", "enabled": true },
+    { "id": "gnews-linkedin", "url": "https://news.google.com/rss/search?q=site%3Alinkedin.com%2Fjobs+%22remote%22+when%3A3d&hl=en-US&gl=US&ceid=US%3Aen", "name": "LinkedIn remote (aggregation)", "type": "gnews", "enabled": true },
+    { "id": "cloudflare", "type": "greenhouse", "enabled": true },
+    { "id": "vercel", "type": "greenhouse", "enabled": true },
+    { "id": "remoteok", "type": "remoteok", "enabled": true }
+  ]
+}

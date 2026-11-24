@@ -1,0 +1,108 @@
+# ©️ Asmahri Abderrahman 2026. All rights reserved.
+#
+# Structured-feed scraper (v6.33.0) — the GitHub-hosted ingestion lane.
+#
+# WHY THIS RUNS ON GITHUB, not Cloudflare: PUBLIC repos get UNLIMITED
+# Actions minutes. This workflow fetches every job feed, maps rows to the
+# site schema (zero AI for JSON/ATS sources) and POSTs finished batches
+# to the site's structured ingest lane — the edge spends ONE request per
+# 50-job batch instead of ~50 subrequests + AI chains per cron cycle.
+# The optional Workers-AI polish (messy descriptions only) calls the
+# REST API directly, so it never touches the Workers request wall.
+#
+# SCHEDULE: every 30 minutes — THIS repo is the cron lane (unlimited
+# Actions minutes on public repos; the private source repo keeps a
+# manual-only copy). Runs are idempotent (url dedupe + the API-side
+# UNIQUE contract), so a skipped/failed run just re-ships next time.
+#
+# REQUIRED repo variable (Settings → Secrets and variables → Actions →
+# Variables): SITE_URL = the site's origin (https://…/) — this public
+# copy carries NO default URL on purpose.
+#
+# SECRETS (repo Settings → Secrets and variables → Actions):
+#   INGEST_SECRET  — REQUIRED. Same value as the site's INGEST_SECRET
+#                    (Cloudflare Pages env var, or the admin panel field —
+#                    the env var wins; set at least one).
+#   CRON_SECRET    — REQUIRED for the sync lane. Same value as the site's.
+#   CF_ACCOUNT_ID  — optional. Cloudflare account id, for AI polish.
+#   CF_API_TOKEN   — optional. Workers AI REST token (AI polish).
+#   CF_MODEL       — optional. Pin a polish model (default
+#                    llama-3.3-70b-instruct-fp8-fast + a fallback chain;
+#                    410/404 answers retire a model for the run).
+#   SITE_URL       — REQUIRED variable in this repo (no default here).
+#
+# THE SYNC LANE: this workflow ALSO knocks /api/cron?action=sb-sync
+# (Bearer CRON_SECRET) after shipping batches — the Supabase → D1
+# mirror + maintenance that the retired cron.yml used to trigger. One
+# scheduler, one place. (Keep CRON_SECRET as a repo secret too.)
+
+name: Scraper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  # The overlap guard: a still-running predecessor finishes; the next
+  # slot's run queues behind it (a cancelled run re-ships next time).
+  group: scraper
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install
+        run: pip install -r scraper/requirements.txt
+
+      - name: Scrape feeds and ship batches
+        # v6.34.0: the source list + the AI key pool come from the site's
+        # config channel (GET /api/ingest?config=1) — the dashboard's own
+        # Data Sources list and AI Center keys. CF_* stays as the polish
+        # FALLBACK. The optional knobs cap the AI phase; SCRAPER_SEED pins
+        # the run's random feed order for reproducible tests.
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_MODEL: ${{ vars.CF_MODEL }}
+          ENRICH_LIMIT: ${{ vars.ENRICH_LIMIT }}
+          POLISH_LIMIT: ${{ vars.POLISH_LIMIT }}
+          AI_BUDGET_S: ${{ vars.AI_BUDGET_S }}
+          SCRAPER_SEED: ${{ vars.SCRAPER_SEED }}
+        run: python scraper/scraper.py
+
+      - name: Sync lane (Supabase → D1 mirror + maintenance)
+        # Bounded knock: the endpoint acks and runs in background. A 403
+        # (secret mismatch) fails the run VISIBLE, same doctrine as the
+        # retired cron.yml.
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          url="${SITE_URL:?set the SITE_URL repo variable}/api/cron?action=sb-sync"
+          echo "→ $url"
+          code="$(curl -sS --max-time 120 -o /tmp/sync.json -w '%{http_code}' \
+                       -H "Authorization: Bearer ${CRON_SECRET}" \
+                       "$url")"
+          cat /tmp/sync.json || true
+          echo ""
+          case "$code" in
+            200|202) echo "sync lane ok (${code})" ;;
+            403)     echo "CRON_SECRET mismatch (403)"; exit 1 ;;
+            *)       echo "Unexpected HTTP ${code} from sb-sync"; exit 1 ;;
+          esac
