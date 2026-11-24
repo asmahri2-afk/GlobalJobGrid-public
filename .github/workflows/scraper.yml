@@ -1,6 +1,6 @@
 # ©️ Asmahri Abderrahman 2026. All rights reserved.
 #
-# Structured-feed scraper (v6.35.0) — the GitHub-hosted ingestion lane.
+# Structured-feed scraper (v6.35.1) — the GitHub-hosted ingestion lane.
 #
 # WHY THIS RUNS ON GITHUB, not Cloudflare: PUBLIC repos get UNLIMITED
 # Actions minutes. This workflow fetches every job feed, maps rows to the
@@ -16,8 +16,9 @@
 # UNIQUE contract), so a skipped/failed run just re-ships next time.
 #
 # REQUIRED repo variable (Settings → Secrets and variables → Actions →
-# Variables): SITE_URL = the site's origin (https://…/) — this public
-# copy carries NO default URL on purpose.
+# Variables): SITE_URL = the site's origin (https://… — with or without a
+# trailing slash; every lane normalizes it) — this public copy carries NO
+# default URL on purpose.
 #
 # SECRETS (repo Settings → Secrets and variables → Actions):
 #   INGEST_SECRET  — REQUIRED. Same value as the site's INGEST_SECRET
@@ -43,14 +44,24 @@ on:
     # :00/:30 are the two most congested cron minutes on GitHub Actions —
     # scheduled runs get delayed or silently DROPPED there under load
     # (evidence: 9 runs so far, all manual, zero scheduled fires across
-    # 4+ h of those slots). 13/43 = same 30-min cadence (48 runs/day),
+    # 4+ h of those slots). 17/47 = same 30-min cadence (48 runs/day),
     # off-peak minutes. Cron is UTC; fires on the default branch only.
-    - cron: "13,43 * * * *"
+    # v6.35.1 — moved off 13/43: the documented schedule-re-registration
+    # nudge (GitHub documents that schedules registered by a deprovisioned
+    # actor stop firing while manual dispatch keeps working; a cron change
+    # committed by an active account with write access re-registers it).
+    - cron: "17,47 * * * *"
   workflow_dispatch: {}
 
 concurrency:
-  # The overlap guard: a still-running predecessor finishes; the next
-  # slot's run queues behind it (a cancelled run re-ships next time).
+  # The overlap guard: a still-running predecessor is never cancelled
+  # (cancel-in-progress: false). GitHub holds AT MOST ONE pending run per
+  # group — a newer pending run REPLACES the older pending one. (v6.35.1:
+  # the old comment wrongly claimed an unlimited queue. `queue: max`
+  # exists but is deliberately NOT used — backlogging up to 100 full
+  # rescans would burn AI credits on already-stored rows. Runs are
+  # idempotent (url dedupe + the API-side UNIQUE contract), so a replaced
+  # pending run costs nothing: the next slot rescans the same feeds.)
   group: scraper
   cancel-in-progress: false
 
@@ -63,6 +74,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2 (v6.35.0 audit: SHA-pinned)
+        with:
+          persist-credentials: false # v6.35.1 — the scraper never pushes; no token in git config
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0 (SHA-pinned)
         with:
@@ -92,22 +105,42 @@ jobs:
         run: python scraper/scraper.py
 
       - name: Sync lane (Supabase → D1 mirror + maintenance)
-        # Bounded knock: the endpoint acks and runs in background. A 403
-        # (secret mismatch) fails the run VISIBLE, same doctrine as the
-        # retired cron.yml.
+        # v6.35.1 — external-audit hardening: `if: always()` so a failed
+        # scrape still triggers maintenance (the site's own cron-driver
+        # also fires sb-sync every ≤15 min — this knock is a nudge, not
+        # the only path); the URL is trailing-slash-normalized (SITE_URL
+        # was documented as an origin WITH a slash); a missing CRON_SECRET
+        # fails loud BEFORE the call; the response body is VALIDATED
+        # (200 must carry ok:true — the endpoint's actual contract, see
+        # cron.js handleCronTrigger) and only a sanitized verdict prints
+        # (never the raw body — these are PUBLIC Actions logs).
+        if: always()
         env:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           SITE_URL: ${{ vars.SITE_URL }}
         run: |
-          url="${SITE_URL:?set the SITE_URL repo variable}/api/cron?action=sb-sync"
+          base="${SITE_URL:?set the SITE_URL repo variable}"
+          base="${base%/}"
+          : "${CRON_SECRET:?set the CRON_SECRET repository secret}"
+          url="${base}/api/cron?action=sb-sync"
           echo "→ $url"
           code="$(curl -sS --max-time 120 -o /tmp/sync.json -w '%{http_code}' \
                        -H "Authorization: Bearer ${CRON_SECRET}" \
                        "$url")"
-          cat /tmp/sync.json || true
-          echo ""
+          ok="$(python3 -c 'import json
+          try:
+              d = json.load(open("/tmp/sync.json"))
+              print("yes" if (d.get("ok") or d.get("success")) else "no")
+          except Exception:
+              print("unparseable")')"
           case "$code" in
-            200|202) echo "sync lane ok (${code})" ;;
-            403)     echo "CRON_SECRET mismatch (403)"; exit 1 ;;
-            *)       echo "Unexpected HTTP ${code} from sb-sync"; exit 1 ;;
+            200) if [ "$ok" = "yes" ]; then
+                   echo "sync lane ok (200, body confirms ok:true)"
+                 else
+                   echo "sync lane answered 200 WITHOUT ok:true (${ok})"
+                   exit 1
+                 fi ;;
+            202) echo "sync lane accepted (202 — run_active/background)" ;;
+            403) echo "CRON_SECRET mismatch (403)"; exit 1 ;;
+            *)   echo "Unexpected HTTP ${code} from sb-sync"; exit 1 ;;
           esac

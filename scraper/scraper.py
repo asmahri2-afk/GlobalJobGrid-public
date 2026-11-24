@@ -1,5 +1,5 @@
 # ©️ Asmahri Abderrahman 2026. All rights reserved.
-"""Structured job feeds scraper (v6.35.0).
+"""Structured job feeds scraper (v6.35.1).
 
 Runs on GitHub Actions (public-repo unlimited minutes). CONFIG-DRIVEN
 since v6.34.0: the source list AND the AI key pool come from the site —
@@ -61,6 +61,7 @@ import os
 import random
 import re
 import sys
+from email.utils import parsedate_to_datetime
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -432,10 +433,13 @@ def cf_polish(job: dict) -> bool:
                 job["description"] = text
                 return True
             return False
-        except Exception:  # noqa: BLE001 — polish is best-effort
+        except Exception as exc:  # noqa: BLE001 — polish is best-effort
             # v6.35.0 — audit M32: requests exception text embeds the full
             # REST URL (the CF account id rides it) — never print it to
             # the PUBLIC Actions logs; the exception class is enough.
+            # (v6.35.1 — external-audit catch: the binding was dropped in
+            # v6.35.0 while the reference stayed — a NameError in the
+            # handler that masked the original polish failure.)
             print(f"    cf polish failed ({job['url'][:60]}): {type(exc).__name__}", file=sys.stderr)
             return False
     return False
@@ -509,16 +513,33 @@ def is_fresh(iso_date) -> bool:
     ISO-8601, RFC-822 and epoch formats)."""
     if not iso_date:
         return True
+    text = str(iso_date).strip()
     try:
-        text = str(iso_date)
         if text.isdigit():
             dt = datetime.fromtimestamp(int(text) / (1000 if len(text) > 10 else 1), tz=timezone.utc)
         else:
-            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            try:
+                dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                # v6.35.1 — external-audit finding: RFC-822/RSS dates
+                # ("Wed, 12 Nov 2026 08:00:00 GMT") used to fall into the
+                # unparseable-admit path, so feeds publishing them had
+                # their real (often stale) ages ignored entirely.
+                dt = parsedate_to_datetime(text)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - dt).days <= PUBLISHED_WITHIN_DAYS
+        age_days = (datetime.now(timezone.utc) - dt).days
+        # v6.35.1 — external-audit finding: future-dated rows passed the
+        # check (a negative age is ≤ any bound). More than 7 days ahead
+        # is a feed clock error — stale by policy, not "freshest ever".
+        if age_days < -7:
+            return False
+        return age_days <= PUBLISHED_WITHIN_DAYS
     except Exception:  # noqa: BLE001 — unparseable dates stay admitted
+        # (deliberate policy: feeds frequently carry garbage dates, and
+        # rejecting them would drop whole legitimate sources; the two
+        # real gaps — RFC-822 support and the future bound — are closed
+        # above.)
         return True
 
 
@@ -1324,6 +1345,9 @@ def main() -> int:
         return 1
     cfg = fetch_config()
     feeds = load_feeds(cfg)
+    # v6.35.1 — the config channel ships the site's recent stored urls so
+    # AI is spent only on genuinely new rows (see the enrich/polish gates).
+    known_urls: set[str] = set((cfg or {}).get("known_urls") or [])
     pool = ProviderPool((cfg or {}).get("pool"))
     if cfg and cfg.get("pool"):
         print("pool: " + ", ".join(f"{p}×{len(ks)}" for p, ks in sorted(cfg["pool"].items())))
@@ -1376,6 +1400,14 @@ def main() -> int:
     # source only takes its leftover share at the end.
     if enrich_queue:
         enrich_queue[:] = fair_share_deal(enrich_queue)
+        # v6.35.1 — external-audit "dedup after AI" finding: already-stored
+        # rows leave the AI queue (they were enriched when first stored;
+        # re-enriching every run is a pure credit burn at 48 runs/day).
+        if known_urls:
+            before = len(enrich_queue)
+            enrich_queue[:] = [r for r in enrich_queue if r["url"] not in known_urls]
+            if before != len(enrich_queue):
+                print(f"enrich: {before - len(enrich_queue)} row(s) skipped — already stored (known_urls)")
     deadline = time.time() + AI_BUDGET_S
     enriched = 0
     enrich_errors = 0
@@ -1394,7 +1426,12 @@ def main() -> int:
         print(f"enrich: {enriched}/{min(len(enrich_queue), ENRICH_LIMIT)} rows extracted, "
               f"{skipped} dropped" + (f", {enrich_errors} errors" if enrich_errors else ""))
 
-    thin = [j for j in all_jobs if len(j["description"]) < 120][:POLISH_LIMIT]
+    # v6.35.1 — external-audit "dedup after AI" finding: polish only
+    # genuinely NEW rows — a known url's polished description is already
+    # stored on the site; re-polishing it every run is a pure credit burn.
+    # (Known rows still ship — the edge's UNIQUE contract dedupes.)
+    thin = [j for j in all_jobs if len(j["description"]) < 120
+            and j["url"] not in known_urls][:POLISH_LIMIT]
     polished = 0
     for job in thin:
         try:
@@ -1462,7 +1499,14 @@ def main() -> int:
             print(f"batch {i // MAX_BATCH + 1}: HTTP {resp.status_code} {out.get('error')}", file=sys.stderr)
             if resp.status_code == 403:
                 return 4  # secret mismatch — fail loud, never silently
-            if resp.status_code not in (200, 409, 429):
+            if resp.status_code == 200:
+                # v6.35.1 — external-audit finding: a 200 whose body says
+                # success:false used to fall through (200 was in the
+                # tolerated set) — a rejected batch, silently skipped.
+                # The edge answers 200 only on success shapes today, but
+                # fail-loud beats a silent drop if that ever changes.
+                return 3
+            if resp.status_code not in (409, 429):
                 return 3
         time.sleep(3.2)  # v6.35.0 — ≥ the edge's 20/min ingest limiter (2s admitted 30/min and tail batches 429'd)
 
