@@ -1488,7 +1488,14 @@ def main() -> int:
         if resp is None:
             return 3
         if resp.status_code == 200 and out.get("success"):
-            n = (out.get("inserted") or 0) + (out.get("sb_inserted") or 0)
+            # v6.35.4 — cross-repo contract fix (the site's newCount rule,
+            # cron.js handleIngest): in supabase mode `inserted` is the
+            # D1-mirrored SUBSET of `sb_inserted` (sbRouteJobInserts), so
+            # the old sum double-counted every inline-mirrored row — masked
+            # in production only while D1 writes were quota-parked. The
+            # sb_inserted count is the new-row total whenever non-zero;
+            # d1 / d1_fallback modes carry inserted only.
+            n = (out.get("sb_inserted") or 0) or (out.get("inserted") or 0)
             stored += n
             duplicates += out.get("duplicates") or 0
             rejected += out.get("rejected") or 0
