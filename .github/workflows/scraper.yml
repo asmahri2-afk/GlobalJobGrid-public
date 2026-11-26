@@ -1,6 +1,6 @@
 # ©️ Asmahri Abderrahman 2026. All rights reserved.
 #
-# Structured-feed scraper (v6.35.1) — the GitHub-hosted ingestion lane.
+# Structured-feed scraper (v6.37.3) — the GitHub-hosted ingestion lane.
 #
 # WHY THIS RUNS ON GITHUB, not Cloudflare: PUBLIC repos get UNLIMITED
 # Actions minutes. This workflow fetches every job feed, maps rows to the
@@ -155,4 +155,50 @@ jobs:
                    echo "403 challenge (HTML body — Bot Fight Mode/WAF, NOT a secret mismatch)"; exit 1
                  fi ;;
             *)   echo "Unexpected HTTP ${code} from sb-sync"; exit 1 ;;
+          esac
+
+      - name: Tables sync lane (all-table backfill + reverse trickle)
+        # v6.37.3 — belt-and-braces for action=sb-tables, the ONLY lane
+        # that syncs ingestion_logs / job_vecs / view_dedup / visitors
+        # both ways (the starved phases 7-8 of the sb-sync engine). The
+        # sb-sync knock above already re-dispatches it internally
+        # (cron.js, with SELF_KNOCK_UA since v6.37.3) — this direct knock
+        # is the durable second door: its own invocation, its own fresh
+        # subrequest budget (the v6.34.5 doctrine), and no dependency on a
+        # UA-heuristic passing at the edge. Same response contract as the
+        # sync lane.
+        if: always()
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          SITE_URL: ${{ vars.SITE_URL }}
+        run: |
+          base="${SITE_URL:?set the SITE_URL repo variable}"
+          base="${base%/}"
+          : "${CRON_SECRET:?set the CRON_SECRET repository secret}"
+          url="${base}/api/cron?action=sb-tables"
+          echo "→ $url"
+          ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          code="$(curl -sS --max-time 120 -o /tmp/tables.json -w '%{http_code}' \
+                       -A "$ua" -H "Authorization: Bearer ${CRON_SECRET}" \
+                       "$url")"
+          ok="$(python3 -c 'import json
+          try:
+              d = json.load(open("/tmp/tables.json"))
+              print("yes" if (d.get("ok") or d.get("success")) else "no")
+          except Exception:
+              print("unparseable")')"
+          case "$code" in
+            200) if [ "$ok" = "yes" ]; then
+                   echo "tables lane ok (200, body confirms ok:true)"
+                 else
+                   echo "tables lane answered 200 WITHOUT ok:true (${ok})"
+                   exit 1
+                 fi ;;
+            202) echo "tables lane accepted (202 — run_active/background)" ;;
+            403) if [ "$(head -c 1 /tmp/tables.json 2>/dev/null)" = "{" ]; then
+                   echo "CRON_SECRET mismatch (403, JSON auth reject)"; exit 1
+                 else
+                   echo "403 challenge (HTML body — Bot Fight Mode/WAF, NOT a secret mismatch)"; exit 1
+                 fi ;;
+            *)   echo "Unexpected HTTP ${code} from sb-tables"; exit 1 ;;
           esac

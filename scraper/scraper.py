@@ -48,6 +48,11 @@ Ship contract:
     {"jobs": [...]}             (max 50/batch)
     POST {SITE_URL}/api/ingest  {"pool_report": {...}}  (run-end telemetry)
 
+Exit codes (v6.37.3 — all fail-loud): 0 ok · 1 missing secret/SITE_URL ·
+    2 zero jobs + failed sources · 3 ship/transport failure ·
+    4 secret mismatch · 5 ingest 429 after 3 attempts (batch dropped —
+    was silently green before v6.37.3)
+
 Why outside Cloudflare: the edge pipeline spends ~50 subrequests per run
 plus AI chains; here GitHub pays the compute and the edge's cost per
 50-job batch is ONE request.
@@ -185,7 +190,12 @@ def clean(text, limit: int) -> str:
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", " ", str(text))
-    text = re.sub(r"&[a-z#0-9]+;", " ", text, flags=re.I)
+    # v6.37.3 — DECODE entities, never delete them: the old
+    # re.sub(r"&[a-z#0-9]+;", " ") ate the character entirely
+    # ("Research &amp; Development" → "Research Development"). Tags
+    # strip FIRST, entities decode after — the reverse order would
+    # re-create tags from &lt;b&gt; and strip real text.
+    text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:limit]
 
@@ -321,7 +331,16 @@ class ProviderPool:
                         self.key_cooldown[(pid, idx)] = until
                     if not backoff_done and pid != "nvidia":
                         backoff_done = True
-                        time.sleep(0.8)  # one 800ms backoff retry (ai.js v6.3.1)
+                        # v6.37.3 — honor the server's Retry-After on the
+                        # immediate retry too (it was stored for later walks,
+                        # but the retry slept a flat 800ms anyway and re-hit
+                        # a key the server had just parked). Bounded at 20s
+                        # inline; a longer park rotates to the next key NOW
+                        # instead of burning the run's AI wall clock.
+                        wait = max(0.8, until - time.time()) if until else 0.8
+                        if wait > 20:
+                            return None  # rotate — too long to wait inline
+                        time.sleep(wait)  # one backoff retry (ai.js v6.3.1)
                         continue
                     return None  # rotate to the next key
                 if resp.status_code in (401, 402, 403):
@@ -1513,7 +1532,17 @@ def main() -> int:
                 # The edge answers 200 only on success shapes today, but
                 # fail-loud beats a silent drop if that ever changes.
                 return 3
-            if resp.status_code not in (409, 429):
+            if resp.status_code == 429:
+                # v6.37.3 — external-audit finding (verified): a final 429
+                # after the 3-attempt backoff sat in the tolerated set —
+                # the batch (up to 50 jobs) was silently dropped while the
+                # workflow stayed green. Fail loud instead: the lane is
+                # idempotent, so the next scheduled run re-scans the same
+                # feeds; a red run here surfaces real loss, not noise.
+                print(f"batch {i // MAX_BATCH + 1}: 429 after 3 attempts — batch dropped; "
+                      "failing the run (the next run re-scans the same feeds)", file=sys.stderr)
+                return 5
+            if resp.status_code != 409:
                 return 3
         time.sleep(3.2)  # v6.35.0 — ≥ the edge's 20/min ingest limiter (2s admitted 30/min and tail batches 429'd)
 
